@@ -1,0 +1,484 @@
+import 'package:flutter/material.dart';
+import '../../data/local/app_database.dart';
+import '../../l10n/app_strings.dart';
+import '../../services/api_service.dart';
+import '../../services/sync_worker.dart';
+
+class SyncStatusView extends StatefulWidget {
+  final ApiService api;
+  final SyncWorker? syncWorker;
+
+  const SyncStatusView({
+    super.key,
+    required this.api,
+    this.syncWorker,
+  });
+
+  @override
+  State<SyncStatusView> createState() => _SyncStatusViewState();
+}
+
+class _SyncStatusViewState extends State<SyncStatusView> {
+  bool _isLoading = true;
+  List<OutboxMutationEntry> _pendingMutations = [];
+  List<OutboxMutationEntry> _failedMutations = [];
+
+  @override
+  void initState() {
+    super.initState();
+    widget.syncWorker?.addListener(_onSyncWorkerChanged);
+    _loadMutations();
+  }
+
+  @override
+  void dispose() {
+    widget.syncWorker?.removeListener(_onSyncWorkerChanged);
+    super.dispose();
+  }
+
+  void _onSyncWorkerChanged() {
+    if (mounted) {
+      _loadMutations();
+    }
+  }
+
+  Future<void> _loadMutations() async {
+    setState(() => _isLoading = true);
+    final pending = await widget.api.db.outboxDao.getPendingQueue();
+    final failed = await widget.api.db.outboxDao.getFailedMutations();
+    if (mounted) {
+      setState(() {
+        _pendingMutations = pending;
+        _failedMutations = failed;
+        _isLoading = false;
+      });
+    }
+  }
+
+  String _formatPlainReason(String? code) {
+    switch (code) {
+      case 'INSUFFICIENT_STOCK':
+        return 'Stock finished at office godown (गोदाम में स्टॉक समाप्त)';
+      case 'DEPENDENT_SHOP_REJECTED':
+        return 'Shop was rejected by office; dependent order cancelled (दुकान अस्वीकृत हो गई)';
+      case 'FORBIDDEN_ROLE_ACTION':
+        return 'Not permitted for this role (इस कार्य की अनुमति नहीं)';
+      case 'IDEMPOTENCY_PAYLOAD_MISMATCH':
+        return 'Duplicate transaction with conflicting data';
+      case 'UNSUPPORTED_MUTATION_TYPE':
+        return 'Update format not supported by server';
+      case 'INVALID_UNIT_MULTIPLIER':
+        return 'Product unit packaging mismatch with office master';
+      case 'BAD_REQUEST':
+        return 'Invalid data rejected by office server';
+      default:
+        return code ?? 'Submission rejected by office server';
+    }
+  }
+
+  Future<void> _cancelFailed(OutboxMutationEntry m) async {
+    await widget.api.db.outboxDao.cancelMutation(m.id);
+    if (m.provisionalBusinessId != null) {
+      widget.api.releaseOrderReservation(m.provisionalBusinessId!, reason: 'User cancelled');
+    }
+    await _loadMutations();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Mutation cancelled and local reservation released.')),
+      );
+    }
+  }
+
+  Future<void> _retryFailed(OutboxMutationEntry m) async {
+    await widget.api.db.outboxDao.resetFailedToPending(m.id);
+    await _loadMutations();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Re-queued mutation for sync.')),
+      );
+    }
+  }
+
+  void _showTimelineModal(String orderId) async {
+    final timeline = await widget.api.getOrderAuditTimeline(orderId);
+    if (!mounted) return;
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                AppStrings.auditTimeline,
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Order ID: $orderId',
+                style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+              ),
+              const Divider(height: 24),
+              for (int i = 0; i < timeline.length; i++) ...[
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Column(
+                      children: [
+                        Icon(
+                          timeline[i].isCompleted
+                              ? Icons.check_circle
+                              : Icons.radio_button_unchecked,
+                          color: timeline[i].isCompleted
+                              ? Colors.green[700]
+                              : Colors.amber[800],
+                          size: 22,
+                        ),
+                        if (i < timeline.length - 1)
+                          Container(
+                            width: 2,
+                            height: 28,
+                            color: Colors.grey[300],
+                          ),
+                      ],
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            timeline[i].title,
+                            style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          Text(
+                            timeline[i].subtitle,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey[600],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                if (i < timeline.length - 1) const SizedBox(height: 4),
+              ],
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: Text(AppStrings.close),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(AppStrings.syncStatusTitle),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _loadMutations,
+            tooltip: AppStrings.retry,
+          ),
+        ],
+      ),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: _loadMutations,
+              child: ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  // Main honest status card
+                  Card(
+                    elevation: 3,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      side: BorderSide(color: Colors.blueGrey.shade200),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.offline_pin, color: Colors.blue[800], size: 28),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  AppStrings.savedOnPhoneOutbox,
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.blue[900],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            AppStrings.pendingMutationsCount(_pendingMutations.length),
+                            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              Icon(Icons.access_time, size: 14, color: Colors.grey[700]),
+                              const SizedBox(width: 4),
+                              Expanded(
+                                child: Text(
+                                  widget.syncWorker?.lastSuccessfulSyncTime != null
+                                      ? 'Catalog as of: ${widget.syncWorker!.lastSuccessfulSyncTime!.hour.toString().padLeft(2, '0')}:${widget.syncWorker!.lastSuccessfulSyncTime!.minute.toString().padLeft(2, '0')} (अंतिम सिंक समय)'
+                                      : 'Catalog: Working from local device copy (ऑफलाइन कॉपी)',
+                                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: Colors.amber.shade50,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.amber.shade200),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(Icons.info_outline, size: 18, color: Colors.amber[900]),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    AppStrings.syncWorkerNote,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w500,
+                                      color: Colors.amber[900],
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  if (_failedMutations.isNotEmpty) ...[
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: Colors.red[800], size: 20),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Needs Attention (${_failedMutations.length})',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.red[900],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    ..._failedMutations.map((m) {
+                      final plainReason = _formatPlainReason(m.lastErrorCode);
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 10),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          side: BorderSide(color: Colors.red.shade300),
+                        ),
+                        color: Colors.red.shade50,
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Text(
+                                    m.mutationType,
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                                  ),
+                                  const Spacer(),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                    decoration: BoxDecoration(
+                                      color: Colors.red.shade100,
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: const Text(
+                                      'REJECTED',
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.red,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              if (m.provisionalBusinessId != null)
+                                Text(
+                                  'Provisional: ${m.provisionalBusinessId}',
+                                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+                                ),
+                              const SizedBox(height: 4),
+                              Text(
+                                plainReason,
+                                style: TextStyle(fontSize: 12, color: Colors.red.shade800),
+                              ),
+                              const SizedBox(height: 10),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: [
+                                  TextButton.icon(
+                                    icon: const Icon(Icons.cancel_outlined, size: 16, color: Colors.red),
+                                    label: const Text('Cancel & Release', style: TextStyle(color: Colors.red)),
+                                    onPressed: () => _cancelFailed(m),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.refresh, size: 16),
+                                    label: const Text('Retry Sync'),
+                                    onPressed: () => _retryFailed(m),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+
+                  const SizedBox(height: 16),
+                  Text(
+                    'Local Outbox Queue (Ordered FIFO)',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.grey[800],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+
+                  if (_pendingMutations.isEmpty)
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Center(
+                          child: Text(
+                            'No pending mutations. Outbox queue is clear.',
+                            style: TextStyle(color: Colors.grey[600]),
+                          ),
+                        ),
+                      ),
+                    )
+                  else
+                    ..._pendingMutations.map((m) {
+                      final dt = DateTime.fromMillisecondsSinceEpoch(m.createdAtEpochMs);
+                      final timeStr =
+                          '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+                      final honestLabel = widget.api.getHonestSyncStatusLabel(m.syncStatus);
+
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 10),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: ListTile(
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                          leading: CircleAvatar(
+                            backgroundColor: Colors.blueGrey.shade100,
+                            child: Text(
+                              '#${m.sequenceOrder}',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.blueGrey.shade900,
+                              ),
+                            ),
+                          ),
+                          title: Row(
+                            children: [
+                              Text(
+                                m.mutationType,
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                              ),
+                              const Spacer(),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: Colors.amber.shade100,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  m.syncStatus,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.amber.shade900,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const SizedBox(height: 4),
+                              Text(
+                                'Provisional: ${m.provisionalBusinessId}',
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                              Text(
+                                '$honestLabel • $timeStr',
+                                style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                              ),
+                            ],
+                          ),
+                          trailing: (m.provisionalBusinessId?.startsWith('LOCAL-ORD-') ?? false) ||
+                                  (m.provisionalBusinessId?.startsWith('ord_') ?? false)
+                              ? IconButton(
+                                  icon: const Icon(Icons.timeline, color: Colors.blue),
+                                  tooltip: AppStrings.auditTimeline,
+                                  onPressed: () => _showTimelineModal(
+                                    m.provisionalBusinessId!,
+                                  ),
+                                )
+                              : null,
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+    );
+  }
+}
